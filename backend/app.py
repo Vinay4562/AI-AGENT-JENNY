@@ -40,19 +40,17 @@ app = FastAPI()
 router = APIRouter()
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
-# Allow CORS for frontend
+# Allow CORS for frontend (configurable via env CORS_ORIGINS, comma-separated)
+_cors_origins_env = os.getenv("CORS_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()] or [
+    "http://localhost:3000",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://my-own-ai-agent.vercel.app",
-    ],
-    allow_origin_regex=r"https://([a-z0-9-]+\.)*vercel\.app$|https://([a-z0-9-]+\.)*onrender\.com$",
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
-    allow_headers=["*", "Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
-    expose_headers=["*"],
-    max_age=86400,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
@@ -304,44 +302,6 @@ async def generate_suggestions(payload: dict = Body(...)):
 
 # ===================== AUTH =====================
 
-# Handle preflight OPTIONS requests for auth endpoints
-@router.options("/auth/{path:path}")
-async def auth_options(path: str):
-    return {"message": "OK"}
-
-# Specific OPTIONS handler for delete endpoint
-@router.options("/auth/delete")
-async def delete_options():
-    from fastapi.responses import Response
-    # Get the origin from the request to dynamically set CORS headers
-    from fastapi import Request
-    request = Request
-    origin = request.headers.get("origin", "https://my-own-ai-agent.vercel.app")
-    
-    # Check if origin is one of our allowed domains
-    allowed_origins = [
-        "https://my-own-ai-agent.vercel.app",
-        "https://my-own-ai-agent-hxcehl8hx-vinay-kumars-projects-f1559f4a.vercel.app"
-    ]
-    
-    if origin in allowed_origins:
-        cors_origin = origin
-    else:
-        cors_origin = "https://my-own-ai-agent.vercel.app"  # Default to main domain
-    
-    response = Response(
-        content="",
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": cors_origin,
-            "Access-Control-Allow-Methods": "DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Origin, X-Requested-With",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Max-Age": "86400"
-        }
-    )
-    return response
-
 def _hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
@@ -424,8 +384,7 @@ def auth_forgot(payload: dict = Body(...)):
             users_col.update_one({"_id": ObjectId(user.get("_id"))}, {"$set": {"resetToken": token, "resetTokenExp": expires}})
         except Exception:
             users_col.update_one({"_id": user.get("_id")}, {"$set": {"resetToken": token, "resetTokenExp": expires}})
-        # Use the main Vercel domain for password reset emails
-        reset_link = f"https://my-own-ai-agent.vercel.app/reset?token={token}"
+        reset_link = f"{APP_URL}/reset?token={token}"
         subject = "Password reset for My AI Agent"
         html = f"""
         <p>Hello,</p>
@@ -442,22 +401,17 @@ def auth_forgot(payload: dict = Body(...)):
 
 @router.post("/auth/reset")
 def auth_reset(payload: dict = Body(...)):
-    logger.info(f"Password reset attempt received for token: {payload.get('token', '')[:10]}...")
     if users_col is None:
-        logger.error("Database not configured for password reset")
         raise HTTPException(status_code=500, detail="Database not configured")
     token = (payload.get("token") or "").strip()
     new_password = payload.get("password") or ""
     if not token or not new_password:
-        logger.warning("Missing token or password in reset request")
         raise HTTPException(status_code=400, detail="Missing token or password")
     user = users_col.find_one({"resetToken": token})
     if not user:
-        logger.warning(f"Invalid reset token: {token[:10]}...")
         raise HTTPException(status_code=400, detail="Invalid token")
     exp = int(user.get("resetTokenExp") or 0)
     if exp <= int(time.time()):
-        logger.warning(f"Expired reset token: {token[:10]}...")
         raise HTTPException(status_code=400, detail="Token expired")
     hashed = _hash_password(new_password)
     try:
@@ -471,44 +425,27 @@ def auth_reset(payload: dict = Body(...)):
             {"_id": user.get("_id")},
             {"$set": {"password": hashed}, "$unset": {"resetToken": "", "resetTokenExp": ""}},
         )
-    logger.info(f"Password reset successful for user: {user.get('email', 'unknown')}")
     return {"ok": True}
 
 
 @router.delete("/auth/delete")
 def auth_delete(authorization: str | None = Header(default=None)):
-    logger.info("Delete account request received")
     if users_col is None or chats_col is None:
-        logger.error("Database not configured for delete account")
         raise HTTPException(status_code=500, detail="Database not configured")
     if not authorization or not authorization.lower().startswith("bearer "):
-        logger.warning("Missing or invalid authorization header")
         raise HTTPException(status_code=401, detail="Missing token")
     token = authorization.split(" ", 1)[1]
-    logger.info(f"Processing delete request for token: {token[:10]}...")
     payload = _decode_jwt(token)
     if not payload:
-        logger.warning("Invalid JWT token for delete account")
         raise HTTPException(status_code=401, detail="Invalid token")
     user_id = payload.get("sub")
-    logger.info(f"Deleting account for user ID: {user_id}")
-    
     # Delete user and chats
     try:
         from bson import ObjectId
         users_col.delete_one({"_id": ObjectId(user_id)})
-        logger.info(f"User {user_id} deleted successfully")
-    except Exception as e:
-        logger.error(f"Error deleting user {user_id}: {e}")
+    except Exception:
         users_col.delete_one({"_id": user_id})
-    
-    try:
-        chats_col.delete_many({"userId": user_id})
-        logger.info(f"Chats for user {user_id} deleted successfully")
-    except Exception as e:
-        logger.error(f"Error deleting chats for user {user_id}: {e}")
-    
-    logger.info(f"Account deletion completed for user {user_id}")
+    chats_col.delete_many({"userId": user_id})
     return {"ok": True}
 
 @router.get("/chats")
@@ -555,18 +492,8 @@ def save_chats(payload: dict = Body(...), authorization: str | None = Header(def
     return {"ok": True}
 
 
-@app.get("/")
-async def root():
-    return {"message": "AI Agent Backend is running!", "status": "healthy"}
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "cors_enabled": True, "timestamp": int(time.time())}
-
 app.include_router(router)
 
 if __name__ == "__main__":
     import uvicorn
-    import os
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
