@@ -517,6 +517,22 @@ const App: React.FC = () => {
     }
   }
 
+  async function sendHttpFallback(prompt: string) {
+    try {
+      const apiBase = resolveApiBaseUrl();
+      const res = await fetch(`${apiBase}/chat/${encodeURIComponent(prompt)}`);
+      if (!res.ok) throw new Error('HTTP fallback failed');
+      const data = await res.json();
+      const text = String(data?.response || '');
+      setMessages((prev) => [...prev, { role: 'ai', content: text }]);
+    } catch (e: any) {
+      addToast('error', e?.message || 'Failed to get response');
+    } finally {
+      setIsLoading(false);
+      setStreamTargetIndex(null);
+    }
+  }
+
   const sendMessage = () => {
     if (!input.trim()) return;
 
@@ -540,11 +556,17 @@ const App: React.FC = () => {
         }
         return updated;
       });
+      const canUseWS = ws.current && ws.current.readyState === WebSocket.OPEN;
       setIsLoading(true);
-      setStreamTargetIndex(aiIndex);
+      setStreamTargetIndex(canUseWS ? aiIndex : null);
       followUpAddedRef.current = false;
       setEditingIndex(null);
-      sendOrQueue(payload);
+      if (canUseWS) {
+        sendOrQueue(payload);
+      } else {
+        // Append AI response using HTTP fallback
+        sendHttpFallback(input);
+      }
       setInput('');
       setAttachedImage(null);
       setIncludeAttachment(true);
@@ -553,7 +575,13 @@ const App: React.FC = () => {
     }
 
     setMessages((prev) => [...prev, { role: 'user', content: input, attachment: attachedImage && includeAttachment ? { data: attachedImage, mime: guessMimeFromDataUrl(attachedImage) } : undefined }]);
-    sendOrQueue(payload);
+    const canUseWS = ws.current && ws.current.readyState === WebSocket.OPEN;
+    if (canUseWS) {
+      sendOrQueue(payload);
+    } else {
+      // Use HTTP fallback when WS is not available
+      sendHttpFallback(input);
+    }
     setInput('');
     setAttachedImage(null);
     setIncludeAttachment(true);
